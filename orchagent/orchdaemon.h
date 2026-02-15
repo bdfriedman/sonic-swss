@@ -29,6 +29,7 @@
 #include "crmorch.h"
 #include "vrforch.h"
 #include "vxlanorch.h"
+#include "evpnmhorch.h"
 #include "vnetorch.h"
 #include "countercheckorch.h"
 #include "flexcounterorch.h"
@@ -60,6 +61,7 @@
 #include "dash/dashportmaporch.h"
 #include "high_frequency_telemetry/hftelorch.h"
 #include <sairedis.h>
+#include "shlorch.h"
 
 using namespace swss;
 
