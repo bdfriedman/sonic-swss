@@ -156,8 +156,8 @@ static string getProtocolString(int proto)
     /* libnl3 did not resolve the name; use well-known protocol names */
     switch (proto) {
     case 186: return "bgp";
-    case 188: return "isis";
-    case 187: return "ospf";
+    case 187: return "isis";
+    case 188: return "ospf";
     case 189: return "rip";
     case 192: return "eigrp";
     case 196: return "nhrp";
