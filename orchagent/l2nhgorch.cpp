@@ -602,49 +602,52 @@ bool L2NhgOrch::updateL2NhgVtepIp(string nh_id, string new_vtep_ip)
             SWSS_LOG_INFO("L2 nexthop %s is referenced in nexthop group %s",
                           nh_id.c_str(), it->first.c_str());
 
-            // Delete the SAI next hop for old vtep and add the SAI next hop for new vtep
+            /* Create new SAI NH member first, then remove old — ensures the NHG
+             * is never left without a member if the new creation succeeds. */
+            if (!vxlan_orch->getTunnelPort(new_vtep_ip, tunnel, false) || tunnel.m_tunnel_id == 0)
+            {
+                SWSS_LOG_ERROR("Cannot create next hop group member. P2P Tunnel to %s does not exist", new_vtep_ip.c_str());
+                return false;
+            }
+
+            auto nh_info = createSaiNextHop(it->second.oid, tunnel.m_tunnel_id, new_vtep_ip);
+            if (nh_info.first == SAI_NULL_OBJECT_ID || nh_info.second == SAI_NULL_OBJECT_ID)
+            {
+                SWSS_LOG_ERROR("Failed to create new next hop and a member to next hop group 0x%" PRIx64, it->second.oid);
+                return false;
+            }
+
+            /* New member created successfully — now remove old member */
             if (vxlan_orch->getTunnelPort(m_nhg_vtep[nh_id].ip, tunnel, false) && tunnel.m_tunnel_id != 0)
             {
                 bool ret = removeSaiNextHop(it->second.next_hops[nh_id]);
                 if (!ret)
                 {
-                    SWSS_LOG_ERROR("Failed to remove SAI next hop %s for %s", nh_id.c_str(), it->first.c_str());
+                    SWSS_LOG_ERROR("Failed to remove old SAI next hop %s for %s", nh_id.c_str(), it->first.c_str());
+                    /* Attempt to clean up the newly created member to avoid leak */
+                    L2NextHopEntry cleanup_entry;
+                    cleanup_entry.nhgm_oid = nh_info.first;
+                    cleanup_entry.nh_oid = nh_info.second;
+                    removeSaiNextHop(cleanup_entry);
                     return false;
                 }
             }
             else
             {
-                SWSS_LOG_ERROR("updateL2NhgVtepIp: P2P Tunnel to %s does not exist", m_nhg_vtep[nh_id].ip.c_str());
-                return false;
+                SWSS_LOG_WARN("updateL2NhgVtepIp: Old P2P Tunnel to %s does not exist, skipping old NH removal",
+                             m_nhg_vtep[nh_id].ip.c_str());
             }
-            it->second.next_hops.erase(nh_id);
-            m_nhg_vtep[nh_id].ref_count -= 1;
+
+            /* Update bookkeeping: decrement old, increment new */
             vtep_ptr->updateRemoteEndPointIpRef(m_nhg_vtep[nh_id].ip, false);
             vtep_ptr->cleanupDynamicDIPTunnel(m_nhg_vtep[nh_id].ip);
+            m_nhg_vtep[nh_id].ref_count -= 1;
 
-            if (vxlan_orch->getTunnelPort(new_vtep_ip, tunnel, false) && tunnel.m_tunnel_id != 0)
-            {
-                /* Create and add next hop group member */
-                auto nh_info = createSaiNextHop(it->second.oid, tunnel.m_tunnel_id, new_vtep_ip);
-                if (nh_info.first != SAI_NULL_OBJECT_ID && nh_info.second != SAI_NULL_OBJECT_ID)
-                {
-                    // Storing next hop group member id and next hop id
-                    it->second.next_hops[nh_id].nhgm_oid = nh_info.first;
-                    it->second.next_hops[nh_id].nh_oid = nh_info.second;
-                    vtep_ptr->updateRemoteEndPointIpRef(m_nhg_vtep[nh_id].ip, true);
-                    m_nhg_vtep[nh_id].ref_count += 1;
-                }
-                else
-                {
-                    SWSS_LOG_ERROR("Failed to create new next hop and a member to next hop group 0x%" PRIx64, it->second.oid);
-                    return false;
-                }
-            }
-            else
-            {
-                SWSS_LOG_ERROR("Cannot create next hop group member. P2P Tunnel to %s does not exist", new_vtep_ip.c_str());
-                return false;
-            }
+            it->second.next_hops[nh_id].nhgm_oid = nh_info.first;
+            it->second.next_hops[nh_id].nh_oid = nh_info.second;
+            vtep_ptr->updateRemoteEndPointIpRef(new_vtep_ip, true);
+            m_nhg_vtep[nh_id].ref_count += 1;
+
             auto next_it = std::next(it);
             it = find_if(next_it, m_nhg_nh.end(), has_next_hop);
         }
