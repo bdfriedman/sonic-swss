@@ -2,6 +2,8 @@
 #include <unordered_map>
 #include <chrono>
 #include <limits.h>
+#include <errno.h>
+#include <signal.h>
 #include "orchdaemon.h"
 #include "logger.h"
 #include <sairedis.h>
@@ -30,6 +32,7 @@ extern string                      gMySwitchType;
 extern string                      gMySwitchSubType;
 extern bool                        gOrchUnhealthy;
 extern string                      gSaiErrorString;
+volatile sig_atomic_t              gOrchShutdownRequested = 0;
 
 extern void syncd_apply_view();
 /*
@@ -71,6 +74,9 @@ StpOrch *gStpOrch;
 MuxOrch *gMuxOrch;
 IcmpOrch *gIcmpOrch;
 HFTelOrch *gHFTOrch;
+ShlOrch *gShlOrch;
+EvpnMhOrch *gEvpnMhOrch;
+L2NhgOrch *gL2NhgOrch;
 
 bool gIsNatSupported = false;
 event_handle_t g_events_handle;
@@ -94,14 +100,30 @@ OrchDaemon::~OrchDaemon()
 {
     SWSS_LOG_ENTER();
 
-    // Stop the ring thread before delete orch pointers
+    /*
+     * Stop the ring thread before deleting orch pointers.
+     *
+     * OrchDaemon::start() always launches ring_thread, but popRingBuffer()
+     * returns immediately when gRingBuffer is null (ring mode disabled).
+     * In that case ring_thread is still "joinable" after its entry function
+     * returns, so this teardown path would otherwise dereference a null
+     * gRingBuffer. Before PR #4400 this was unreachable: SIGTERM was not
+     * handled, so ~OrchDaemon() never ran on signal-driven shutdown. The
+     * new graceful shutdown path reaches this destructor on clean exit and
+     * exposes the latent null dereference. Guard the ring buffer accesses
+     * so teardown is safe whether ring mode is enabled or not.
+     */
     if (ring_thread.joinable()) {
-        // notify the ring_thread to exit
-        gRingBuffer->thread_exited = true;
-        gRingBuffer->notify();
+        if (gRingBuffer) {
+            // notify the ring_thread to exit
+            gRingBuffer->thread_exited = true;
+            gRingBuffer->notify();
+        }
         // wait for the ring_thread to exit
         ring_thread.join();
-        disableRingBuffer();
+        if (gRingBuffer) {
+            disableRingBuffer();
+        }
     }
 
     /*
@@ -179,11 +201,13 @@ bool OrchDaemon::init()
     TableConnector conf_asic_sensors(m_configDb, CFG_ASIC_SENSORS_TABLE_NAME);
     TableConnector conf_switch_hash(m_configDb, CFG_SWITCH_HASH_TABLE_NAME);
     TableConnector conf_switch_trim(m_configDb, CFG_SWITCH_TRIMMING_TABLE_NAME);
+    TableConnector conf_switch_fast_linkup(m_configDb, CFG_SWITCH_FAST_LINKUP_TABLE_NAME);
     TableConnector conf_suppress_asic_sdk_health_categories(m_configDb, CFG_SUPPRESS_ASIC_SDK_HEALTH_EVENT_NAME);
 
     vector<TableConnector> switch_tables = {
         conf_switch_hash,
         conf_switch_trim,
+        conf_switch_fast_linkup,
         conf_asic_sensors,
         conf_suppress_asic_sdk_health_categories,
         app_switch_table
@@ -209,6 +233,19 @@ bool OrchDaemon::init()
     };
 
     gPortsOrch = new PortsOrch(m_applDb, m_stateDb, ports_tables, m_chassisAppDb);
+
+    // Create EvpnMhOrch early so its ES/DF state is available when PortsOrch
+    // processes bridge ports and VLAN members (fixes warm boot ordering)
+    TableConnector appDbDfTable(m_applDb, "EVPN_DF_TABLE");
+    TableConnector confDbEvpnEsTable(m_configDb, "EVPN_ETHERNET_SEGMENT");
+
+    vector<TableConnector> evpn_df_es_table_connectors = {
+        appDbDfTable,
+        confDbEvpnEsTable,
+    };
+
+    gEvpnMhOrch = new EvpnMhOrch(evpn_df_es_table_connectors);
+
     TableConnector stateDbFdb(m_stateDb, STATE_FDB_TABLE_NAME);
     TableConnector stateMclagDbFdb(m_stateDb, STATE_MCLAG_REMOTE_FDB_TABLE_NAME);
     gFdbOrch = new FdbOrch(m_applDb, app_fdb_tables, stateDbFdb, stateMclagDbFdb, gPortsOrch);
@@ -272,8 +309,14 @@ bool OrchDaemon::init()
     ChassisOrch* chassis_frontend_orch = new ChassisOrch(m_configDb, m_applDb, chassis_frontend_tables, vnet_rt_orch);
     gDirectory.set(chassis_frontend_orch);
 
-    gIntfsOrch = new IntfsOrch(m_applDb, APP_INTF_TABLE_NAME, vrf_orch, m_chassisAppDb);
+    vector<table_name_with_pri_t> intf_tables = {
+        { APP_INTF_TABLE_NAME,  IntfsOrch::intfsorch_pri},
+        { APP_SAG_TABLE_NAME,   IntfsOrch::intfsorch_pri}
+    };
+
+    gIntfsOrch = new IntfsOrch(m_applDb, intf_tables, vrf_orch, m_chassisAppDb);
     gDirectory.set(gIntfsOrch);
+
     gNeighOrch = new NeighOrch(m_applDb, APP_NEIGH_TABLE_NAME, gIntfsOrch, gFdbOrch, gPortsOrch, m_chassisAppDb);
     gDirectory.set(gNeighOrch);
 
@@ -468,6 +511,8 @@ bool OrchDaemon::init()
 
     gNhgMapOrch = new NhgMapOrch(m_applDb, APP_FC_TO_NHG_INDEX_MAP_TABLE_NAME);
 
+    gL2NhgOrch = new L2NhgOrch(m_applDb, APP_L2_NEXTHOP_GROUP_TABLE_NAME);
+
     /*
      * The order of the orch list is important for state restore of warm start and
      * the queued processing in m_toSync map after gPortsOrch->allPortsReady() is set.
@@ -476,8 +521,7 @@ bool OrchDaemon::init()
      * when iterating ConsumerMap. This is ensured implicitly by the order of keys in ordered map.
      * For cases when Orch has to process tables in specific order, like PortsOrch during warm start, it has to override Orch::doTask()
      */
-    m_orchList = { gSwitchOrch, gCrmOrch, gPortsOrch, gBufferOrch, gFlowCounterRouteOrch, gIntfsOrch, gNeighOrch, gNhgMapOrch, gNhgOrch, gCbfNhgOrch, gFgNhgOrch, gRouteOrch, gCoppOrch, gQosOrch, wm_orch, gPolicerOrch, gTunneldecapOrch, sflow_orch, gDebugCounterOrch, gMacsecOrch, bgp_global_state_orch, gBfdOrch, gIcmpOrch, gSrv6Orch, gMuxOrch, mux_cb_orch, gMonitorOrch, gBfdMonitorOrch, gStpOrch};
-
+    m_orchList = { gSwitchOrch, gCrmOrch, gPortsOrch, gEvpnMhOrch, gBufferOrch, gFlowCounterRouteOrch, gIntfsOrch, gNeighOrch, gNhgMapOrch, gNhgOrch, gCbfNhgOrch, gFgNhgOrch, gRouteOrch, gCoppOrch, gQosOrch, wm_orch, gPolicerOrch, gTunneldecapOrch, sflow_orch, gDebugCounterOrch, gMacsecOrch, bgp_global_state_orch, gBfdOrch, gIcmpOrch, gSrv6Orch, gMuxOrch, mux_cb_orch, gMonitorOrch, gBfdMonitorOrch, gStpOrch, gL2NhgOrch};
     bool initialize_dtel = false;
     if (platform == BFN_PLATFORM_SUBSTRING || platform == VS_PLATFORM_SUBSTRING)
     {
@@ -525,6 +569,13 @@ bool OrchDaemon::init()
 
     gIsoGrpOrch = new IsoGrpOrch(iso_grp_tbl_ctrs);
 
+    TableConnector appDbShlTbl(m_applDb, APP_EVPN_SPLIT_HORIZON_TABLE_NAME);
+    vector<TableConnector> shl_tbl_ctrs = {
+        appDbShlTbl
+    };
+
+    gShlOrch = new ShlOrch(shl_tbl_ctrs);
+
     //
     // Policy Based Hashing (PBH) orchestrator
     //
@@ -552,6 +603,7 @@ bool OrchDaemon::init()
     m_orchList.push_back(vxlan_tunnel_orch);
     m_orchList.push_back(evpn_nvo_orch);
     m_orchList.push_back(vxlan_tunnel_map_orch);
+    m_orchList.push_back(gShlOrch);
 
     if (vxlan_tunnel_orch->isDipTunnelsSupported())
     {
@@ -824,7 +876,8 @@ bool OrchDaemon::init()
     m_orchList.push_back(&CounterCheckOrch::getInstance(m_configDb));
 
     vector<string> p4rt_tables = {APP_P4RT_TABLE_NAME};
-    gP4Orch = new P4Orch(m_applDb, p4rt_tables, vrf_orch, gCoppOrch);
+    m_p4OrchZmqServer = new swss::ZmqServer(m_p4OrchZmqServerEp, "", false, true);
+    gP4Orch = new P4Orch(m_applDb, p4rt_tables, m_p4OrchZmqServer, vrf_orch, gCoppOrch);
     m_orchList.push_back(gP4Orch);
 
     TableConnector confDbTwampTable(m_configDb, CFG_TWAMP_SESSION_TABLE_NAME);
@@ -928,7 +981,19 @@ void OrchDaemon::start(long heartBeatInterval)
         Selectable *s;
         int ret;
 
+        if (gOrchShutdownRequested != 0)
+        {
+            SWSS_LOG_NOTICE("Received signal %d, shutting down orchagent gracefully", gOrchShutdownRequested);
+            break;
+        }
+
         ret = m_select->select(&s, SELECT_TIMEOUT);
+
+        if (gOrchShutdownRequested != 0)
+        {
+            SWSS_LOG_NOTICE("Received signal %d, shutting down orchagent gracefully", gOrchShutdownRequested);
+            break;
+        }
 
         /*
          * Log an error message periodically if a previous SAI API call failed with
@@ -953,6 +1018,11 @@ void OrchDaemon::start(long heartBeatInterval)
 
         if (ret == Select::ERROR)
         {
+            if (errno == EINTR && gOrchShutdownRequested != 0)
+            {
+                SWSS_LOG_NOTICE("Interrupted by signal %d, shutting down orchagent gracefully", gOrchShutdownRequested);
+                break;
+            }
             SWSS_LOG_NOTICE("Error: %s!\n", strerror(errno));
             continue;
         }
@@ -1360,6 +1430,13 @@ bool DpuOrchDaemon::init()
     DashPortMapOrch *dash_port_map_orch = new DashPortMapOrch(m_dpu_appDb, dash_port_map_tables, m_dpu_appstateDb, dash_zmq_server);
     gDirectory.set(dash_port_map_orch);
 
+    vector<string> dash_ha_flow_tables = {
+        APP_DASH_FLOW_SYNC_SESSION_TABLE_NAME,
+        APP_DASH_FLOW_DUMP_FILTER_TABLE_NAME
+    };
+    DashHaFlowOrch *dash_ha_flow_orch = new DashHaFlowOrch(m_dpu_appDb, dash_ha_flow_tables, m_dpu_appstateDb, dash_zmq_server);
+    gDirectory.set(dash_ha_flow_orch);
+
     addOrchList(dash_acl_orch);
     addOrchList(dash_vnet_orch);
     addOrchList(dash_route_orch);
@@ -1368,6 +1445,7 @@ bool DpuOrchDaemon::init()
     addOrchList(dash_meter_orch);
     addOrchList(dash_ha_orch);
     addOrchList(dash_port_map_orch);
+    addOrchList(dash_ha_flow_orch);
 
     return true;
 }
